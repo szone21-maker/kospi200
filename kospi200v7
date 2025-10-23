@@ -1,0 +1,428 @@
+import streamlit as st
+import requests
+import json
+import pandas as pd
+from datetime import datetime, timedelta
+import time
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import numpy as np
+import urllib3
+
+# ⚠️ 운영 전 주의: 인증키/계좌번호는 .env 등 안전한 방법으로 주입하세요.
+
+# SSL 경고 메시지 비활성화 (개발용)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+############################################
+#                Core Bot                  #
+############################################
+class KISStockBot:
+    """한국투자증권 OpenAPI를 이용한 코스피200 종목 분석 봇 (개선판)
+
+    변경 사항 요약 (v7):
+    - 지표 확장: 5D 모멘텀, 20D 거래량 Z-Score, 10D 변동성(표준편차), 20D 평균 거래대금 등
+    - 스코어링 개편: 모멘텀/유동성 가중, 변동성 페널티, MA 트렌드/RSI/거래량 신호 통합
+    - 유동성 필터: 20D 평균 거래대금 하한(사용자 설정)
+    """
+
+    def __init__(self, app_key, app_secret, acc_no, acc_prod_cd="01"):
+        self.base_url = "https://openapi.koreainvestment.com:9443"
+        self.app_key = app_key
+        self.app_secret = app_secret
+        self.acc_no = acc_no
+        self.acc_prod_cd = acc_prod_cd
+        self.access_token = None
+
+    def get_access_token(self):
+        """접근 토큰 발급"""
+        url = f"{self.base_url}/oauth2/tokenP"
+        headers = {"content-type": "application/json"}
+        data = {
+            "grant_type": "client_credentials",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+        }
+        res = requests.post(url, headers=headers, data=json.dumps(data), verify=False)
+        if res.status_code == 200:
+            self.access_token = res.json().get("access_token")
+            return self.access_token
+        else:
+            raise RuntimeError(f"토큰 발급 실패: {res.status_code} | {res.text}")
+
+    def get_kospi200_list(self):
+        """코스피200 종목 리스트 (샘플: 일부 발췌)
+        ※ 운영 시에는 KRX/브로커 API로 실시간 동기화 권장
+        """
+        return {
+            "005930": "삼성전자",
+            "000660": "SK하이닉스",
+            "035420": "NAVER",
+            "005380": "현대차",
+            "051910": "LG화학",
+            "006400": "삼성SDI",
+            "035720": "카카오",
+            "028260": "삼성물산",
+            "012330": "현대모비스",
+            "068270": "셀트리온",
+            "207940": "삼성바이오로직스",
+            "105560": "KB금융",
+            "055550": "신한지주",
+            "003670": "포스코퓨처엠",
+            "086790": "하나금융지주",
+        }
+
+    def get_stock_daily_price(self, stock_code):
+        """종목 일별 시세 조회 (최근 ~수십영업일)
+        API 특성상 최신이 0번째 인덱스로 오는 형태를 가정합니다.
+        """
+        url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-daily-price"
+        headers = {
+            "content-type": "application/json",
+            "authorization": f"Bearer {self.access_token}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "tr_id": "FHKST01010400",
+        }
+        params = {
+            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_INPUT_ISCD": stock_code,
+            "FID_PERIOD_DIV_CODE": "D",
+            "FID_ORG_ADJ_PRC": "0",
+        }
+        res = requests.get(url, headers=headers, params=params, verify=False)
+        if res.status_code == 200:
+            return res.json().get("output")
+        raise RuntimeError(f"시세 조회 실패: {stock_code} | {res.status_code} | {res.text}")
+
+    @staticmethod
+    def _to_num(series):
+        return pd.to_numeric(series, errors="coerce")
+
+    def _prep_df(self, price_data: list) -> pd.DataFrame:
+        df = pd.DataFrame(price_data).copy()
+        # 수치형 변환
+        for col in [
+            "stck_oprc",
+            "stck_hgpr",
+            "stck_lwpr",
+            "stck_clpr",
+            "acml_vol",
+        ]:
+            df[col] = self._to_num(df[col])
+        # 최신행이 0번째라고 가정 → 분석/플로팅 편의를 위해 최신이 아래로 오도록 뒤집음
+        df = df.iloc[::-1].reset_index(drop=True)
+
+        # 날짜를 datetime으로 정규화
+        if "stck_bsop_date" in df.columns:
+            df["stck_bsop_date"] = pd.to_datetime(df["stck_bsop_date"], format="%Y%m%d", errors="coerce")
+
+        # 기본 지표
+        df["ret1"] = df["stck_clpr"].pct_change()
+        df["ret5"] = df["stck_clpr"].pct_change(5)
+        df["ma5"] = df["stck_clpr"].rolling(5).mean()
+        df["ma20"] = df["stck_clpr"].rolling(20).mean()
+        df["vol_ma5"] = df["acml_vol"].rolling(5).mean()
+        df["vol_ma20"] = df["acml_vol"].rolling(20).mean()
+        df["vol_z20"] = (df["acml_vol"] - df["vol_ma20"]) / df["acml_vol"].rolling(20).std()
+        df["volatility10"] = df["ret1"].rolling(10).std()  # 일별 수익률 10D 표준편차
+
+        # 거래대금(원) 근사치: 종가 * 거래량
+        df["trd_val"] = df["stck_clpr"] * df["acml_vol"]
+        df["trd_val_ma20"] = df["trd_val"].rolling(20).mean()
+
+        # RSI(14)
+        delta = df["stck_clpr"].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+        rs = gain / loss
+        df["rsi14"] = 100 - (100 / (1 + rs))
+
+        return df
+
+    def analyze_stock(self, stock_code: str, stock_name: str, min_trd_val: float):
+        """개별 종목 분석 및 스코어 산출"""
+        raw = self.get_stock_daily_price(stock_code)
+        df = self._prep_df(raw)
+        if len(df) < 25:
+            raise ValueError("이동평균/변동성 계산을 위한 데이터가 부족합니다")
+
+        latest = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        # ---- 유동성 필터 ----
+        avg_trd_val20 = float(latest["trd_val_ma20"]) if pd.notna(latest["trd_val_ma20"]) else 0.0
+        liquidity_pass = bool(avg_trd_val20 >= min_trd_val)
+
+        # ---- 스코어링 ----
+        score = 0.0
+        signals = []
+
+        # 1) 트렌드: MA5 > MA20 (가중치 +4)
+        if latest["ma5"] > latest["ma20"]:
+            score += 4
+            signals.append("MA 골든크로스(5>20)")
+
+        # 2) 모멘텀(5D): 구간 수익률
+        mom5 = latest["ret5"] if pd.notna(latest["ret5"]) else 0.0
+        if mom5 > 0.05:
+            score += 3
+            signals.append(f"5D 모멘텀 강함(+{mom5*100:.1f}%)")
+        elif mom5 > 0.02:
+            score += 2
+            signals.append(f"5D 모멘텀 양호(+{mom5*100:.1f}%)")
+        elif mom5 < -0.03:
+            score -= 1
+            signals.append(f"5D 조정(-{abs(mom5)*100:.1f}%)")
+
+        # 3) 거래량 Z-Score(20D) — 유동성/관심도 가중 (+2/+1)
+        volz = latest["vol_z20"] if pd.notna(latest["vol_z20"]) else 0.0
+        if volz >= 1.5:
+            score += 2
+            signals.append("거래량 급증(Z≥1.5)")
+        elif volz >= 0.5:
+            score += 1
+            signals.append("거래량 증가(Z≥0.5)")
+
+        # 4) RSI(14) — 과열 회피, 45~65 구간 선호
+        rsi = latest["rsi14"] if pd.notna(latest["rsi14"]) else np.nan
+        if pd.notna(rsi):
+            if 45 <= rsi <= 65:
+                score += 1.5
+                signals.append(f"RSI 중립우상({rsi:.1f})")
+            elif rsi < 30:
+                score += 0.5  # 과매도 반등 여지
+                signals.append(f"RSI 과매도({rsi:.1f})")
+            elif rsi > 75:
+                score -= 0.5
+                signals.append(f"RSI 과열({rsi:.1f})")
+
+        # 5) 단기 변동성 페널티 (10D σ) — 과도한 변동 회피
+        vol10 = latest["volatility10"] if pd.notna(latest["volatility10"]) else 0.0
+        if vol10 >= 0.035:  # 3.5% 이상
+            score -= 1.0
+            signals.append("변동성 높음(10D σ≥3.5%)")
+        elif vol10 >= 0.025:
+            score -= 0.5
+            signals.append("변동성 다소 높음")
+
+        # 6) 전일 대비 등락 보너스(+1)
+        day_chg = (latest["stck_clpr"] - prev["stck_clpr"]) / prev["stck_clpr"]
+        if day_chg > 0:
+            score += 1
+            signals.append(f"전일 대비 +{day_chg*100:.2f}%")
+
+        result = {
+            "code": stock_code,
+            "name": stock_name,
+            "price": int(latest["stck_clpr"]),
+            "ma5": float(latest["ma5"]) if pd.notna(latest["ma5"]) else None,
+            "ma20": float(latest["ma20"]) if pd.notna(latest["ma20"]) else None,
+            "rsi": float(rsi) if pd.notna(rsi) else None,
+            "volume": int(latest["acml_vol"]) if pd.notna(latest["acml_vol"]) else None,
+            "vol_z20": float(volz) if pd.notna(volz) else None,
+            "mom5": float(mom5) if pd.notna(mom5) else None,
+            "volatility10": float(vol10) if pd.notna(vol10) else None,
+            "avg_trd_val20": avg_trd_val20,
+            "liquidity_pass": liquidity_pass,
+            "score": round(score, 2),
+            "signals": signals,
+            "df": df,  # 최신이 아래인 시계열
+        }
+        return result
+
+############################################
+#                Plotting                  #
+############################################
+
+def plot_stock_chart(df: pd.DataFrame, stock_name: str):
+    df = df.copy()
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+        subplot_titles=(f"{stock_name} 주가", "거래량"), row_heights=[0.7, 0.3]
+    )
+
+    fig.add_trace(
+        go.Candlestick(
+            x=df["stck_bsop_date"],
+            open=df["stck_oprc"], high=df["stck_hgpr"], low=df["stck_lwpr"], close=df["stck_clpr"],
+            name="주가",
+        ),
+        row=1, col=1,
+    )
+
+    fig.add_trace(
+        go.Scatter(x=df["stck_bsop_date"], y=df["ma5"], name="MA5", line=dict(width=1)),
+        row=1, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(x=df["stck_bsop_date"], y=df["ma20"], name="MA20", line=dict(width=1)),
+        row=1, col=1,
+    )
+
+    colors = [
+        "red" if (c - o) >= 0 else "blue"
+        for c, o in zip(df["stck_clpr"], df["stck_oprc"])
+    ]
+    fig.add_trace(
+        go.Bar(x=df["stck_bsop_date"], y=df["acml_vol"], name="거래량", marker_color=colors),
+        row=2, col=1,
+    )
+
+    fig.update_layout(height=600, xaxis_rangeslider_visible=False, showlegend=True, hovermode="x unified")
+    return fig
+
+############################################
+#                Streamlit                 #
+############################################
+
+def main():
+    st.set_page_config(page_title="코스피200 종목 분석 봇 (개선판)", layout="wide")
+    st.title("📈 코스피200 종목 분석 & 추천 — 모멘텀/유동성/변동성 스코어")
+    st.markdown("---")
+
+    # Sidebar
+    with st.sidebar:
+        st.header("⚙️ API 설정")
+        app_key = st.text_input("APP KEY", type="password")
+        app_secret = st.text_input("APP SECRET", type="password")
+        acc_no = st.text_input("계좌번호", value="")
+
+        st.markdown("---")
+        st.header("📊 분석 옵션")
+        top_n = st.slider("추천 종목 개수", 3, 10, 5)
+        min_trd_val_krw = st.number_input(
+            "유동성 하한 (20D 평균 거래대금, 원)",
+            min_value=0, step=1_000_000_000, value=10_000_000_000,
+            help="20거래일 평균(종가×거래량)이 기준 미만이면 후보에서 제외"
+        )
+        analyze_btn = st.button("🔍 분석 시작", type="primary", use_container_width=True)
+
+    if not analyze_btn:
+        st.info("👈 왼쪽 사이드바에서 API 정보를 입력하고 '분석 시작'을 눌러주세요.")
+        st.markdown(
+            """
+            ### 이번 버전의 스코어 구성
+            - **트렌드(5>20MA)**: +4
+            - **5D 모멘텀**: +2 ~ +3 (강도에 따라) / 약세 시 -1
+            - **거래량 Z-Score(20D)**: +1 ~ +2
+            - **RSI(14)**: 45~65 구간 +1.5 / 과매도 +0.5 / 과열 -0.5
+            - **변동성 페널티(10D σ)**: -0.5 ~ -1.0
+            - **전일 대비 상승**: +1
+
+            **유동성 필터**: 20D 평균 거래대금이 하한 미만이면 제외
+            """
+        )
+        return
+
+    # Validation
+    if not app_key or not app_secret:
+        st.error("API KEY를 입력해주세요!")
+        return
+
+    bot = KISStockBot(app_key, app_secret, acc_no)
+
+    with st.spinner("접근 토큰 발급 중..."):
+        try:
+            bot.get_access_token()
+            st.success("✅ 토큰 발급 완료!")
+        except Exception as e:
+            st.error(str(e))
+            return
+
+    stock_dict = bot.get_kospi200_list()
+
+    st.subheader("📊 종목 분석 중...")
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    results = []
+    total = len(stock_dict)
+
+    for idx, (code, name) in enumerate(stock_dict.items()):
+        status_text.text(f"분석 중: {name} ({code}) - {idx+1}/{total}")
+        try:
+            r = bot.analyze_stock(code, name, min_trd_val=min_trd_val_krw)
+            if r and r.get("liquidity_pass", False):
+                results.append(r)
+        except Exception as e:
+            st.warning(f"⚠️ {name} 분석 실패: {e}")
+        time.sleep(0.05)
+        progress_bar.progress((idx + 1) / total)
+
+    status_text.empty(); progress_bar.empty()
+
+    if not results:
+        st.error("유동성 조건을 만족하는 결과가 없습니다. 유동성 하한을 낮춰보세요.")
+        return
+
+    # 점수 정렬
+    results.sort(key=lambda x: x["score"], reverse=True)
+
+    st.markdown("---")
+    st.subheader(f"🎯 매수 추천 종목 TOP {min(top_n, len(results))}")
+
+    cols = st.columns(min(3, max(1, min(top_n, len(results)))))
+    for i, stock in enumerate(results[:top_n]):
+        col = cols[i % len(cols)]
+        with col:
+            st.markdown(f"### {i+1}. {stock['name']}")
+            st.metric("현재가", f"{stock['price']:,}원")
+            st.metric("점수", f"{stock['score']}")
+            st.caption(
+                f"유동성(20D 평균 거래대금): {int(stock['avg_trd_val20']):,}원 | 5D 모멘텀: {stock['mom5']*100 if stock['mom5'] is not None else 0:.1f}% | 변동성(10D σ): {(stock['volatility10']*100 if stock['volatility10'] is not None else 0):.2f}%"
+            )
+            if stock["signals"]:
+                st.write("**매수 신호**")
+                for s in stock["signals"]:
+                    st.markdown(f"- 🔹 {s}")
+
+    # 전체 결과 테이블
+    st.markdown("---")
+    st.subheader("📋 전체 분석 결과")
+    df_results = pd.DataFrame([
+        {
+            "순위": i + 1,
+            "종목명": r["name"],
+            "종목코드": r["code"],
+            "현재가": r["price"],
+            "점수": r["score"],
+            "5D모멘텀(%)": round((r["mom5"] or 0) * 100, 2),
+            "RSI": round(r["rsi"], 1) if r["rsi"] is not None else None,
+            "10Dσ(%)": round((r["volatility10"] or 0) * 100, 2),
+            "거래량Z(20D)": round(r["vol_z20"], 2) if r["vol_z20"] is not None else None,
+            "MA5": round(r["ma5"], 2) if r["ma5"] is not None else None,
+            "MA20": round(r["ma20"], 2) if r["ma20"] is not None else None,
+            "20D평균거래대금": int(r["avg_trd_val20"]) if r["avg_trd_val20"] is not None else None,
+            "신호": ", ".join(r["signals"]) if r["signals"] else "",
+        }
+        for i, r in enumerate(results)
+    ])
+
+    st.dataframe(
+        df_results.assign(현재가=df_results["현재가"].map(lambda x: f"{x:,}원")),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # 상세 차트
+    st.markdown("---")
+    st.subheader("📈 상세 차트")
+    options = [f"{r['name']} ({r['code']})" for r in results[:top_n]]
+    selected = st.selectbox("종목 선택", options=options)
+    if selected:
+        code = selected.split("(")[-1].split(")")[0]
+        r = next((x for x in results if x["code"] == code), None)
+        if r is not None:
+            c1, c2, c3, c4 = st.columns(4)
+            with c1: st.metric("현재가", f"{r['price']:,}원")
+            with c2: st.metric("MA5", f"{r['ma5']:.0f}" if r["ma5"] else "-")
+            with c3: st.metric("MA20", f"{r['ma20']:.0f}" if r["ma20"] else "-")
+            with c4: st.metric("RSI", f"{r['rsi']:.1f}" if r["rsi"] else "-")
+            fig = plot_stock_chart(r["df"], r["name"])
+            st.plotly_chart(fig, use_container_width=True)
+            st.info(f"**매수 신호**: {', '.join(r['signals']) if r['signals'] else '없음'}")
+
+
+if __name__ == "__main__":
+    main()
