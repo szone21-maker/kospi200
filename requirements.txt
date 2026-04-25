@@ -1,6 +1,0 @@
-streamlit
-requests
-pandas
-plotly
-numpy
-urllib3
